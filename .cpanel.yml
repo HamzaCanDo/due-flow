@@ -1,0 +1,7 @@
+---
+deployment:
+  tasks:
+    - export DEPLOYPATH=/home/CPANEL_USERNAME/public_html/
+    - /bin/mkdir -p $DEPLOYPATH
+    - /bin/cp -R assets $DEPLOYPATH
+    - /bin/cp index.php bootstrap.php cron.php install.php schema.sql manifest.webmanifest config.example.php $DEPLOYPATH
