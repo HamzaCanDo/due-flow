@@ -6,6 +6,22 @@ session_set_cookie_params(['httponly'=>true, 'samesite'=>'Lax', 'secure'=>$secur
 session_start();
 if (empty($_SESSION['csrf'])) $_SESSION['csrf'] = bin2hex(random_bytes(32));
 
+function clearRememberCookie(bool $secure): void { setcookie('due_flow_remember', '', ['expires'=>time()-3600, 'path'=>'/', 'httponly'=>true, 'samesite'=>'Lax', 'secure'=>$secure]); }
+function rememberExpiry(): string { return date('Y-m-d H:i:s', time() + 60 * 60 * 24 * 365 * 100); }
+function restoreRememberedLogin(PDO $pdo, bool $secure): void {
+    if (!empty($_SESSION['user_id']) || empty($_COOKIE['due_flow_remember'])) return;
+    $token = (string)$_COOKIE['due_flow_remember']; $hash = hash('sha256', $token);
+    $stmt = $pdo->prepare('SELECT user_id FROM remember_tokens WHERE token_hash = ? AND expires_at > ?');
+    $stmt->execute([$hash, now()]);
+    $userId = $stmt->fetchColumn();
+    if ($userId !== false) {
+        $expires = rememberExpiry();
+        $pdo->prepare('UPDATE remember_tokens SET expires_at = ? WHERE token_hash = ?')->execute([$expires,$hash]);
+        setcookie('due_flow_remember', $token, ['expires'=>strtotime($expires), 'path'=>'/', 'httponly'=>true, 'samesite'=>'Lax', 'secure'=>$secure]);
+        $_SESSION['user_id'] = $userId;
+    }
+}
+restoreRememberedLogin($pdo, $secure);
 function requireLogin(): void { if (empty($_SESSION['user_id'])) jsonResponse(['error'=>'Authentication required'], 401); }
 function requireCsrf(): void { if (!hash_equals((string)$_SESSION['csrf'], (string)($_POST['csrf'] ?? ''))) jsonResponse(['error'=>'Invalid request token'], 419); }
 function queueSync(PDO $pdo, string $type, string $id, array $payload): void {
@@ -20,9 +36,20 @@ if ($action === 'login' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $email = trim((string)($_POST['email'] ?? '')); $password = (string)($_POST['password'] ?? '');
     $stmt = $pdo->prepare('SELECT * FROM users WHERE email = ?'); $stmt->execute([$email]); $user = $stmt->fetch();
     if (!$user || !password_verify($password, $user['password_hash'])) jsonResponse(['error'=>'Invalid email or password'], 422);
-    session_regenerate_id(true); $_SESSION['user_id'] = $user['id']; jsonResponse(['ok'=>true]);
+    session_regenerate_id(true); $_SESSION['user_id'] = $user['id'];
+    if (($_POST['remember'] ?? '') === 'yes') {
+        $token = bin2hex(random_bytes(32)); $expires = rememberExpiry();
+        $pdo->prepare('INSERT INTO remember_tokens (token_hash,user_id,expires_at,created_at) VALUES (?,?,?,?)')->execute([hash('sha256', $token),$user['id'],$expires,now()]);
+        setcookie('due_flow_remember', $token, ['expires'=>strtotime($expires), 'path'=>'/', 'httponly'=>true, 'samesite'=>'Lax', 'secure'=>$secure]);
+    } else {
+        clearRememberCookie($secure);
+    }
+    jsonResponse(['ok'=>true]);
 }
-if ($action === 'logout') { session_destroy(); header('Location: ' . ($config['app']['base_path'] ?? '') . '/'); exit; }
+if ($action === 'logout') {
+    if (!empty($_COOKIE['due_flow_remember'])) $pdo->prepare('DELETE FROM remember_tokens WHERE token_hash = ?')->execute([hash('sha256', (string)$_COOKIE['due_flow_remember'])]);
+    clearRememberCookie($secure); session_destroy(); header('Location: ' . ($config['app']['base_path'] ?? '') . '/'); exit;
+}
 if (str_starts_with($action, 'api/')) {
     requireLogin();
     if ($_SERVER['REQUEST_METHOD'] !== 'GET') requireCsrf();
@@ -63,13 +90,40 @@ if (str_starts_with($action, 'api/')) {
         if ($stmt->rowCount() !== 1) jsonResponse(['error'=>'Only a zero-balance customer can be archived.'], 422);
         queueSync($pdo,'customer',$id,['customer_id'=>$id,'status'=>'archived','archived_at'=>now()]); jsonResponse(['ok'=>true]);
     }
+    if ($action === 'api/customer/paid' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $id = trim((string)($_POST['id'] ?? ''));
+        if ($id === '') jsonResponse(['error'=>'Customer ID is required.'], 422);
+        $pdo->beginTransaction();
+        try {
+            $lock = $pdo->getAttribute(PDO::ATTR_DRIVER_NAME) === 'mysql' ? ' FOR UPDATE' : '';
+            $stmt = $pdo->prepare('SELECT * FROM customers WHERE id = ? AND archived_at IS NULL' . $lock);
+            $stmt->execute([$id]);
+            $customer = $stmt->fetch();
+            if (!$customer) throw new RuntimeException('Active customer not found.');
+            $time = now();
+            $amount = round((float)$customer['outstanding_due'], 2);
+            if ($amount > 0) {
+                $tx = uuid();
+                $pdo->prepare('INSERT INTO transactions (id,customer_id,type,amount,occurred_at,created_at) VALUES (?,?,?,?,?,?)')->execute([$tx,$id,'received',$amount,$time,$time]);
+                queueSync($pdo,'transaction',$tx,['transaction_id'=>$tx,'customer_id'=>$id,'type'=>'received','amount'=>$amount,'occurred_at'=>$time]);
+            }
+            $pdo->prepare('UPDATE customers SET outstanding_due=0, archived_at=?, updated_at=? WHERE id=?')->execute([$time,$time,$id]);
+            $stmt = $pdo->prepare('SELECT * FROM customers WHERE id=?'); $stmt->execute([$id]); $customer = $stmt->fetch();
+            queueSync($pdo,'customer',$id,customerPayload($customer));
+            $pdo->commit();
+            jsonResponse(['ok'=>true,'customer'=>$customer]);
+        } catch (Throwable $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            jsonResponse(['error'=>$e->getMessage()], 422);
+        }
+    }
     if ($action === 'api/reports') {
         $week = preg_match('/^\d{4}-\d{2}-\d{2}$/', (string)($_GET['week'] ?? '')) ? $_GET['week'] : date('Y-m-d');
         $start = new DateTimeImmutable($week); $start = $start->modify('monday this week')->setTime(0,0); $end = $start->modify('+7 days');
-        $stmt = $pdo->prepare("SELECT COALESCE(SUM(CASE WHEN type='given' THEN amount ELSE 0 END),0) given, COALESCE(SUM(CASE WHEN type='received' THEN amount ELSE 0 END),0) received FROM transactions WHERE occurred_at >= ? AND occurred_at < ?");
+        $stmt = $pdo->prepare("SELECT COALESCE(SUM(CASE WHEN type='given' THEN amount ELSE 0 END),0) given, COALESCE(SUM(CASE WHEN type='received' THEN amount ELSE 0 END),0) received, COALESCE(SUM(CASE WHEN type='received' THEN 1 ELSE 0 END),0) paid_count FROM transactions WHERE occurred_at >= ? AND occurred_at < ?");
         $stmt->execute([$start->format('Y-m-d H:i:s'),$end->format('Y-m-d H:i:s')]); $totals = $stmt->fetch();
         $outstanding = (float)$pdo->query("SELECT COALESCE(SUM(outstanding_due),0) total FROM customers WHERE archived_at IS NULL")->fetch()['total'];
-        $report = ['week_start'=>$start->format('Y-m-d'),'week_end'=>$end->modify('-1 day')->format('Y-m-d'),'given'=>(float)$totals['given'],'received'=>(float)$totals['received'],'outstanding'=>$outstanding];
+        $report = ['week_start'=>$start->format('Y-m-d'),'week_end'=>$end->modify('-1 day')->format('Y-m-d'),'given'=>(float)$totals['given'],'received'=>(float)$totals['received'],'paid'=>(float)$totals['received'],'paid_count'=>(int)$totals['paid_count'],'outstanding'=>$outstanding];
         queueSync($pdo, 'weekly_report', $report['week_start'], $report);
         jsonResponse($report);
     }
@@ -83,5 +137,5 @@ if (str_starts_with($action, 'api/')) {
 ?><!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><meta name="theme-color" content="#0b6bcb"><link rel="manifest" href="manifest.webmanifest"><title><?= esc($config['app']['name'] ?? 'Due Flow') ?></title><link rel="stylesheet" href="assets/style.css"></head>
 <body>
-<?php if (empty($_SESSION['user_id'])): ?><main class="auth"><h1>Due Flow</h1><p>Private customer due management</p><form id="login"><input type="email" name="email" placeholder="Email" required autocomplete="username"><input type="password" name="password" placeholder="Password" required autocomplete="current-password"><button>Sign in</button><output></output></form></main>
-<?php else: ?><header><strong>Due Flow</strong><a href="?action=logout">Sign out</a></header><main><section id="dashboard" class="view active"><div class="section-head"><h1>Customers</h1><button id="add">+ Add customer</button></div><div class="tabs"><button class="tab active" data-tab="active">Active</button><button class="tab" data-tab="archived">Archived</button></div><div id="customers"></div></section><section id="reports" class="view"><h1>Weekly summary</h1><div class="week-nav"><button id="prev-week">‹</button><strong id="week-label"></strong><button id="next-week">›</button></div><div class="metrics"><article><small>Money given</small><b id="given">৳0</b></article><article><small>Money received</small><b id="received">৳0</b></article><article><small>Outstanding due</small><b id="outstanding">৳0</b></article></div><p class="hint">Weeks run Monday–Sunday. Payments are included only after confirmation.</p></section><section id="ranking" class="view"><h1>Performance ranking</h1><p class="hint">Score: repayment ratio 60%, recent activity 20%, consistent history 20%; outstanding debt is a small penalty. Ties share positions.</p><div id="ranking-list"></div></section></main><nav class="bottom"><button class="active" data-view="dashboard">Customers</button><button data-view="reports">Reports</button><button data-view="ranking">Ranking</button></nav><dialog id="customer-dialog"><form method="dialog" id="customer-form"><h2 id="form-title">Add customer</h2><input type="hidden" name="id"><label>Name<input name="name" required maxlength="160"></label><label>Phone<div class="phone-row"><input name="phone" type="tel" required maxlength="40" inputmode="tel"><button type="button" id="contacts" title="Choose a contact">+</button></div></label><label>Outstanding due (৳)<input name="due" type="number" min="0" step="0.01" required inputmode="decimal"></label><label>Notes<textarea name="notes" rows="3" maxlength="2000"></textarea></label><output></output><div class="dialog-actions"><button type="button" class="secondary" id="cancel">Cancel</button><button>Save</button></div></form></dialog><?php endif; ?><script>window.DUE_FLOW={csrf:<?= json_encode($_SESSION['csrf']) ?>,base:<?= json_encode($config['app']['base_path'] ?? '') ?>};</script><script src="assets/app.js"></script></body></html>
+<?php if (empty($_SESSION['user_id'])): ?><main class="auth"><h1>Due Flow</h1><p>Private customer due management</p><form id="login"><input type="email" name="email" placeholder="Email" required autocomplete="username"><input type="password" name="password" placeholder="Password" required autocomplete="current-password"><label><input type="checkbox" name="remember" value="yes" checked> Keep me signed in on this device</label><button>Sign in</button><output></output></form></main>
+<?php else: ?><header><strong>Due Flow</strong><a href="?action=logout">Sign out</a></header><main><section id="dashboard" class="view active"><div class="section-head"><h1>Customers</h1><button id="add">+ Add customer</button></div><div class="tabs"><button class="tab active" data-tab="active">Active</button><button class="tab" data-tab="paid">Paid</button></div><div id="customers"></div></section><section id="reports" class="view"><h1>Weekly summary</h1><div class="week-nav"><button id="prev-week">‹</button><strong id="week-label"></strong><button id="next-week">›</button></div><div class="metrics"><article><small>Money given</small><b id="given">৳0</b></article><article><small>Paid this week</small><b id="paid">৳0</b><small><span id="paid-count">0</span> payment(s)</small></article><article><small>Outstanding due</small><b id="outstanding">৳0</b></article></div><p class="hint">Weeks run Monday–Sunday. Paid amounts are included only after confirmation.</p></section><section id="ranking" class="view"><h1>Performance ranking</h1><p class="hint">Score: repayment ratio 60%, recent activity 20%, consistent history 20%; outstanding debt is a small penalty. Ties share positions.</p><div id="ranking-list"></div></section></main><nav class="bottom"><button class="active" data-view="dashboard">Customers</button><button data-view="reports">Reports</button><button data-view="ranking">Ranking</button></nav><dialog id="customer-dialog"><form method="dialog" id="customer-form"><h2 id="form-title">Add customer</h2><input type="hidden" name="id"><label>Name<input name="name" required maxlength="160"></label><label>Phone<div class="phone-row"><input name="phone" type="tel" required maxlength="40" inputmode="tel"><button type="button" id="contacts" title="Choose a contact">+</button></div></label><label>Outstanding due (৳)<input name="due" type="number" min="0" step="0.01" required inputmode="decimal"></label><label>Notes<textarea name="notes" rows="3" maxlength="2000"></textarea></label><output></output><div class="dialog-actions"><button type="button" class="secondary" id="cancel">Cancel</button><button>Save</button></div></form></dialog><?php endif; ?><script>window.DUE_FLOW={csrf:<?= json_encode($_SESSION['csrf']) ?>,base:<?= json_encode($config['app']['base_path'] ?? '') ?>};</script><script src="assets/app.js"></script></body></html>

@@ -21,7 +21,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             ]);
             $schema = file_get_contents(__DIR__ . '/schema.sql');
             foreach (array_filter(array_map('trim', explode(';', (string)$schema))) as $statement) {
-                $pdo->exec($statement);
+                try {
+                    $pdo->exec($statement);
+                } catch (PDOException $schemaError) {
+                    if (($schemaError->errorInfo[1] ?? null) !== 1050) throw $schemaError;
+                }
             }
             $stmt = $pdo->prepare('INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)');
             $stmt->execute([$email, password_hash($password, PASSWORD_DEFAULT), date('Y-m-d H:i:s')]);

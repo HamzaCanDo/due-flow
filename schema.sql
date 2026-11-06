@@ -5,6 +5,15 @@ CREATE TABLE users (
   created_at DATETIME NOT NULL
 ) ENGINE=InnoDB;
 
+CREATE TABLE remember_tokens (
+  token_hash CHAR(64) PRIMARY KEY,
+  user_id INT UNSIGNED NOT NULL,
+  expires_at DATETIME NOT NULL,
+  created_at DATETIME NOT NULL,
+  INDEX idx_remember_tokens_expiry (expires_at),
+  CONSTRAINT fk_remember_tokens_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+) ENGINE=InnoDB;
+
 CREATE TABLE customers (
   id CHAR(36) PRIMARY KEY,
   name VARCHAR(160) NOT NULL,
